@@ -57,7 +57,7 @@ static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void BlinkLED();
 int ReadSensor();
-void SendToGCS();
+void TelemetryToGCS();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -104,12 +104,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  SensorValue = ReadSensor();		// Get a Sensor reading (from ADC).
-	  SendToGCS(SensorValue);			// Send Sensor's value to the Ground Control Station (GCS).
+	  SensorValue = ReadSensor();		// Activate sensor and get the sensor's value (from ADC).
+	  TelemetryToGCS(SensorValue);		// Send Sensor's value to the Ground Control Station (GCS).
 
 	  // Delay until next Sensor reading
 	  HAL_Delay(1000);
-
 
     /* USER CODE END WHILE */
 
@@ -304,24 +303,25 @@ void BlinkLED()
 	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
 }
 
-// Read the sattelite sensor (ADC1/AN0 in this case).
+// Read the satellite sensor (ADC1/AN0 in this case).
 int ReadSensor()
 {
 	HAL_ADC_Start(&hadc1);						// Start the ADC conversion
-	HAL_ADC_PollForConversion(&hadc1, 1000);		// Poll the ADC for a converted value. Timeout in 1000 ms.
+	HAL_ADC_PollForConversion(&hadc1, 1000);	// Poll the ADC for a converted value. Timeout in 1000 ms.
 	SensorValue = HAL_ADC_GetValue(&hadc1);		// Read the polled value from the ADC.
-	HAL_ADC_Stop(&hadc1);							// Stop converting.
+	HAL_ADC_Stop(&hadc1);						// Stop converting.
 	BlinkLED();
 
 	return SensorValue;
 }
 
 // Send a message to the GroundCOntrolStation (GCS), by USART1.
-void SendToGCS(int SensorValue)
+void TelemetryToGCS(int sensorValue)
 {
-	char msg[32]={0};														// Message string, to be sent over USART1/Serial/USB to Ground Control Station.
-	snprintf(msg, sizeof(msg), "Sensor value: %d\r\n", SensorValue);		// Populate msg string with text and ADC value. Use snprintf to prevent buffer overflow.
-	HAL_UART_Transmit(&huart1, (const uint8_t*) msg, sizeof(msg), 100);		// Send the message out through USART1 / USB.
+	char msg[128]={0};																					// Message string, to be sent over USART1/Serial/USB to Ground Control Station. Initialized to 0, to prevent garbage text.
+	uint32_t uptime = HAL_GetTick();  // milliseconds since boot
+	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms | Sensor: %5d |\r\n", uptime, sensorValue);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
+	HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);								// Send the message string out through USART1 / USB.
 }
 
 
