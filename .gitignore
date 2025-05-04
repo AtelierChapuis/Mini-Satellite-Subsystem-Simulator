@@ -1,0 +1,38 @@
+# STM32CubeIDE build output
+/Debug/
+/Release/
+/build/
+/build-*/          # Some users have build folders with build-type suffixes
+
+# IDE-specific files
+/.settings/
+/.cproject
+.project
+*.launch
+
+# User-specific metadata
+*.log
+*.orig
+*.swp
+*.swo
+*.bak
+
+# Generated files
+*.elf
+*.map
+*.bin
+*.hex
+*.lst
+*.d
+*.o
+*.dep
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Optional: CMake or Makefile leftovers
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
