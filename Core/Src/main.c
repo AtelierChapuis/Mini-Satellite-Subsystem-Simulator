@@ -42,11 +42,12 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint16_t SensorValue;
+
 
 // Variables needed to receive messages from the USART1.
 #define RX_BUFFER_SIZE 32
@@ -54,18 +55,28 @@ uint8_t rx_byte;
 char command_buffer[RX_BUFFER_SIZE];
 uint8_t cmd_index = 0;
 
+// Variables related to ADC conversion and value.
+uint16_t sensor_dma_buf[1];  		// Sensor (ADC) conversion result. Here done via DMA.
+uint16_t sensor_value = 0;			// This is also the output value of the ADC conversion. Set sensor_value = sensor_dma_buf[0] in HAL_ADC_ConvCpltCallback().
+									// Use sensor_value to increase code readability, and since this variable will be used by other funcs. Also allows for future manipulations of sensor_dma_buf[] without changing each reference.
+// Variables related to the log.
+#define LOG_BUFFER_SIZE 1024
+char log_buffer[LOG_BUFFER_SIZE];
+size_t log_index = 0;		//size_t is defined as uint32_t on STM32.
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void BlinkLED();
-int ReadSensor();
+void ReadSensor();
 void TelemetryToGCS();
+void log_message(const char* msg);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -102,31 +113,29 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	//Call the callback func "HAL_UART_RxCpltCallback" when a message is received over USART1.
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	// Call the callback func "HAL_UART_RxCpltCallback" when a message is received over USART1. This must be reset after message reception, if another message will be received.
 
+  //Log message to indicate that satellite subsystem is ready.
+  log_message("Device Ready.");
 
+  // Send a welcome message to the GCS console.
   char welcomeMessage1[] = "\r\n--- Welcome to the Ground Control Station ---\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage1, strlen(welcomeMessage1), HAL_MAX_DELAY);
-  char welcomeMessage2[] = "Type a command below.\r\n";
+  char welcomeMessage2[] = "LED ON \t\t LED OFF \t DUMP LOG\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage2, strlen(welcomeMessage2), HAL_MAX_DELAY);
+  char welcomeMessage3[] = "Type a command below.\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage3, strlen(welcomeMessage3), HAL_MAX_DELAY);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  //SensorValue = ReadSensor();			// Activate sensor and get the sensor's value (from ADC).
-	  //TelemetryToGCS(SensorValue);		// Send Sensor's value to the Ground Control Station (GCS).
-
-	  //Receive message from USART1:
-	  //HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_data, 1);	//Save incoming message to rx_data. 6 bytes.
-
-
-	  // Delay until next Sensor reading
-//	  HAL_Delay(1000);
 
     /* USER CODE END WHILE */
 
@@ -269,6 +278,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -313,55 +338,109 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+// Logger
+void log_message(const char* msg) {
+
+	// Remove any \n or \r from end of the input message. This help with proper formatting at the GCS.
+    char clean_msg[100];
+    strncpy(clean_msg, msg, sizeof(clean_msg) - 1);	// Create a local copy of the message
+    clean_msg[sizeof(clean_msg) - 1] = '\0';
+
+    // Strip trailing newline or carriage return
+    size_t clean_len = strlen(clean_msg);
+    while (clean_len > 0 && (clean_msg[clean_len - 1] == '\n' || clean_msg[clean_len - 1] == '\r')) {
+        clean_msg[--clean_len] = '\0';
+    }
+
+
+	char log_entry[128];
+
+	// Get time since last reboot.
+	uint32_t ms = HAL_GetTick();
+	uint32_t sec = ms / 1000;
+	uint32_t h = sec / 3600;
+	uint32_t m = (sec % 3600) / 60;
+	uint32_t s = sec % 60;
+
+	snprintf(log_entry, sizeof(log_entry), "[%02lu:%02lu:%02lu] %s\r\n", h, m, s, clean_msg);
+
+
+	size_t entry_len = strlen(log_entry);
+    if (log_index + entry_len < LOG_BUFFER_SIZE) {		// Prevent buffer overflow.
+        strcpy(&log_buffer[log_index], log_entry);
+        log_index += entry_len;
+    }
+}
+
 // Blink the on-board LED quickly.
 void BlinkLED()
 {
-	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 1);
+	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
+    HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 1);
 	HAL_Delay(100);
 	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
 }
 
 
-// Read the satellite sensor (ADC1/AN0 in this case).
-int ReadSensor()
+// Read the satellite sensor (ADC1/IN0 in this case) using DMA.
+void ReadSensor()
 {
-	HAL_ADC_Start(&hadc1);						// Start the ADC conversion
-	HAL_ADC_PollForConversion(&hadc1, 1000);	// Poll the ADC for a converted value. Timeout in 1000 ms.
-	SensorValue = HAL_ADC_GetValue(&hadc1);		// Read the polled value from the ADC.
-	HAL_ADC_Stop(&hadc1);						// Stop converting.
-	BlinkLED();
+	// Start DMA to do ADC conversion. Call "conversion complete callback" (HAL_ADC_ConvCpltCallback()) when DMA job is finished.
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)sensor_dma_buf, 1);	// Take AN ADC reading and store into var "sensor_dma_buf".
 
-	return SensorValue;
+	//BlinkLED();		// May cause problems if called from within an interrupt, due to HAL_Delay().
 }
 
 
-// Send a message to the GroundCOntrolStation (GCS), by USART1.
-void TelemetryToGCS(int sensorValue)
+// Send a message to the Ground Control Station (GCS), by USART1.
+void TelemetryToGCS()
 {
 	char msg[128]={0};																					// Message string, to be sent over USART1/Serial/USB to Ground Control Station. Initialized to 0, to prevent garbage text.
 	uint32_t uptime = HAL_GetTick();  // milliseconds since boot
-	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms | Sensor: %5d |\r\n", uptime, sensorValue);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
+	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms | Sensor: %5d |\r\n", uptime, sensor_value);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
+
 	HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);								// Send the message string out through USART1 / USB.
+	log_message(msg);
 }
 
 
 // Invoke this function when data is received from USART1 and it's interrupt is triggered.
+// This is the data received from the Ground Control Station
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		// Copied from "stm32f7xx_hal_uart.c".
 {
 	if (huart->Instance == USART1) {
 		HAL_UART_Transmit(&huart1, &rx_byte, 1, HAL_MAX_DELAY);	// Echo the received character
 	    if (rx_byte == '\r' || rx_byte == '\n') {
 	    	command_buffer[cmd_index] = '\0';  // Null-terminate
-	    	// Respond and act on command:
+	    	// Respond and act on command.
+	    	// Use IF here instead of SWITCH, since CASE can't be used with strings ("case "LED ON":" will give error).
 	    	if (strcmp(command_buffer, "LED ON") == 0) {
 	    		HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);  // Turn LED on
-	    		char response[] = "\r\nLED turned ON\r\n";
+	            char message[] = "LED turned ON";
+	            char response[64];
+	            snprintf(response, sizeof(response), "\r\n%s\r\n", message);
 	    		HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+	    		log_message(message);
 	    	}
 	    	else if (strcmp(command_buffer, "LED OFF") == 0) {
 	            HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);  // Turn LED off
-                char response[] = "\r\nLED turned OFF\r\n";
+	            char message[] = "LED turned OFF";
+	            char response[64];
+	            snprintf(response, sizeof(response), "\r\n%s\r\n", message);
                 HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+                log_message(message);
+	        }
+	    	else if (strcmp(command_buffer, "STATUS") == 0) {
+	    		ReadSensor();				// Read the sensor's value.
+	    		//Wait until DMA conversion complete callback is done. This is better with a semaphore.
+		    	TelemetryToGCS();			// Send Sensor's value to the Ground Control Station (GCS). This must wait until the ADC conversion is complete and the conversion complete callback function is finished - otherwise it will report a sensor value of '0'.
+	        }
+	    	else if (strcmp(command_buffer, "DUMP LOG") == 0) {
+                char response[] = "\r\nLOG DUMP:\r\n";
+                HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+	    		HAL_UART_Transmit(&huart1, (uint8_t*)log_buffer, log_index, HAL_MAX_DELAY);
+	    		char response2[] = "\r\nLOG DUMP complete\r\n";
+	    		HAL_UART_Transmit(&huart1, (uint8_t *)response2, strlen(response2), HAL_MAX_DELAY);
 	        }
 	    	else {
                 char response[] = "\r\nUnknown command\r\n";
@@ -378,6 +457,24 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		// Copied from "stm32f7
 	    }
 	    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);  // Re-enable interrupt
 	}
+}
+
+// DMA calls this func when done the conversion of the ADC.
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        sensor_value = sensor_dma_buf[0];		// Use sensor_value to increase code readability, and since this variable will be used by other funcs. Also allows for future manipulations of sensor_dma_buf[] without changing each reference.
+
+        // TEST: Send ADC value to USART1.
+        //char msg[64];
+        //snprintf(msg, sizeof(msg), "Sensor Value: %u\r\n", sensor_value);
+        //HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        // Convert the int sensor_value to a string before sending for logging.
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%d", sensor_value);
+        log_message(msg);
+        //log_message(sensor_value);
+    }
 }
 
 
