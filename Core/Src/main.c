@@ -107,6 +107,11 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	//Call the callback func "HAL_UART_RxCpltCallback" when a message is received over USART1.
 
+
+  char welcomeMessage1[] = "\r\n--- Welcome to the Ground Control Station ---\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage1, strlen(welcomeMessage1), HAL_MAX_DELAY);
+  char welcomeMessage2[] = "Type a command below.\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage2, strlen(welcomeMessage2), HAL_MAX_DELAY);
   /* USER CODE END 2 */
 
   /* Infinite loop */
