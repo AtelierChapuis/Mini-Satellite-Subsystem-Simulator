@@ -47,6 +47,14 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 uint16_t SensorValue;
+
+// Variables needed to receive messages from the USART1.
+#define RX_BUFFER_SIZE 32
+uint8_t rx_byte;
+char command_buffer[RX_BUFFER_SIZE];
+uint8_t cmd_index = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -97,6 +105,7 @@ int main(void)
   MX_ADC1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	//Call the callback func "HAL_UART_RxCpltCallback" when a message is received over USART1.
 
   /* USER CODE END 2 */
 
@@ -104,11 +113,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  SensorValue = ReadSensor();		// Activate sensor and get the sensor's value (from ADC).
-	  TelemetryToGCS(SensorValue);		// Send Sensor's value to the Ground Control Station (GCS).
+	  //SensorValue = ReadSensor();			// Activate sensor and get the sensor's value (from ADC).
+	  //TelemetryToGCS(SensorValue);		// Send Sensor's value to the Ground Control Station (GCS).
+
+	  //Receive message from USART1:
+	  //HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_data, 1);	//Save incoming message to rx_data. 6 bytes.
+
 
 	  // Delay until next Sensor reading
-	  HAL_Delay(1000);
+//	  HAL_Delay(1000);
 
     /* USER CODE END WHILE */
 
@@ -303,6 +316,7 @@ void BlinkLED()
 	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
 }
 
+
 // Read the satellite sensor (ADC1/AN0 in this case).
 int ReadSensor()
 {
@@ -315,6 +329,7 @@ int ReadSensor()
 	return SensorValue;
 }
 
+
 // Send a message to the GroundCOntrolStation (GCS), by USART1.
 void TelemetryToGCS(int sensorValue)
 {
@@ -322,6 +337,42 @@ void TelemetryToGCS(int sensorValue)
 	uint32_t uptime = HAL_GetTick();  // milliseconds since boot
 	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms | Sensor: %5d |\r\n", uptime, sensorValue);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
 	HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);								// Send the message string out through USART1 / USB.
+}
+
+
+// Invoke this function when data is received from USART1 and it's interrupt is triggered.
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		// Copied from "stm32f7xx_hal_uart.c".
+{
+	if (huart->Instance == USART1) {
+		HAL_UART_Transmit(&huart1, &rx_byte, 1, HAL_MAX_DELAY);	// Echo the received character
+	    if (rx_byte == '\r' || rx_byte == '\n') {
+	    	command_buffer[cmd_index] = '\0';  // Null-terminate
+	    	// Respond and act on command:
+	    	if (strcmp(command_buffer, "LED ON") == 0) {
+	    		HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);  // Turn LED on
+	    		char response[] = "\r\nLED turned ON\r\n";
+	    		HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+	    	}
+	    	else if (strcmp(command_buffer, "LED OFF") == 0) {
+	            HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);  // Turn LED off
+                char response[] = "\r\nLED turned OFF\r\n";
+                HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+	        }
+	    	else {
+                char response[] = "\r\nUnknown command\r\n";
+                HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
+	    	}
+
+	    	cmd_index = 0;  // Reset for next command
+	    }
+
+	    else {
+	    	if (cmd_index < RX_BUFFER_SIZE - 1) {
+	    		command_buffer[cmd_index++] = rx_byte;
+	        }
+	    }
+	    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);  // Re-enable interrupt
+	}
 }
 
 
