@@ -65,12 +65,12 @@ const osThreadAttr_t telemetryTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for EDACTask */
-osThreadId_t EDACTaskHandle;
-const osThreadAttr_t EDACTask_attributes = {
-  .name = "EDACTask",
+/* Definitions for LinkMonitorTask */
+osThreadId_t LinkMonitorTaskHandle;
+const osThreadAttr_t LinkMonitorTask_attributes = {
+  .name = "LinkMonitorTask",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityAboveNormal,
 };
 /* Definitions for sensorTask */
 osThreadId_t sensorTaskHandle;
@@ -79,10 +79,10 @@ const osThreadAttr_t sensorTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
-/* Definitions for sensorBufferMutex */
-osMutexId_t sensorBufferMutexHandle;
-const osMutexAttr_t sensorBufferMutex_attributes = {
-  .name = "sensorBufferMutex"
+/* Definitions for adcSem */
+osSemaphoreId_t adcSemHandle;
+const osSemaphoreAttr_t adcSem_attributes = {
+  .name = "adcSem"
 };
 /* USER CODE BEGIN PV */
 
@@ -92,22 +92,17 @@ const osMutexAttr_t sensorBufferMutex_attributes = {
 uint8_t rx_byte;
 char command_buffer[RX_BUFFER_SIZE];
 uint8_t cmd_index = 0;
-// Variables related to ADC conversion and value.
-uint16_t sensor_dma_buf[1];  		// Sensor (ADC) conversion result. Here done via DMA.
-//uint16_t sensor_value = 0;			// This is also the output value of the ADC conversion. Set sensor_value = sensor_dma_buf[0] in HAL_ADC_ConvCpltCallback().
-									// Use sensor_value to increase code readability, and since this variable will be used by other funcs. Also allows for future manipulations of sensor_dma_buf[] without changing each reference.
 // Variables related to the log.
 #define LOG_BUFFER_SIZE 1024
 char log_buffer[LOG_BUFFER_SIZE];
-size_t log_index = 0;		//size_t is defined as uint32_t on STM32.
-// Buffer to hold the last few sensor readings
-#define SENSOR_BUFFER_MAX 5
-uint8_t sensor_buffer[SENSOR_BUFFER_MAX];
-uint8_t sensor_buffer_index = 0;
+size_t log_index = 0;				//size_t is defined as uint32_t on STM32.
 //Random Number Generator:
 extern RNG_HandleTypeDef hrng;
-
-
+// Link Strength Status
+uint8_t rssi = 0;			//Strength of the satellite Uplink/Downlink in 0-100%. (Received Signal Strength Indicator)
+/* Buffer to store ADC values */
+uint16_t adc_value;
+char uart_buffer[20];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -119,11 +114,11 @@ static void MX_USART1_UART_Init(void);
 static void MX_RNG_Init(void);
 void StartHealthCheckTask(void *argument);
 void StartTelemetryTask(void *argument);
-void StartEDACTask(void *argument);
+void StartLinkMonitorTask(void *argument);
 void StartSensorTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void ReadSensor();
+//void ReadSensor();
 void TelemetryToGCS();
 void log_message(const char* msg);
 /* USER CODE END PFP */
@@ -171,11 +166,12 @@ int main(void)
 
   //Log message to indicate that satellite subsystem is ready.
   log_message("Device Ready.");
-
+  /* Start ADC with DMA */
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&adc_value, 1);
   // Send a welcome message to the GCS console.
   char welcomeMessage1[] = "\r\n--- Welcome to the Ground Control Station ---\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage1, strlen(welcomeMessage1), HAL_MAX_DELAY);
-  char welcomeMessage2[] = "LED ON - LED OFF - DUMP - LOG STATUS\r\n";
+  char welcomeMessage2[] = "LED ON - LED OFF - DUMP LOG - STATUS\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage2, strlen(welcomeMessage2), HAL_MAX_DELAY);
   char welcomeMessage3[] = "Type a command below.\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)welcomeMessage3, strlen(welcomeMessage3), HAL_MAX_DELAY);
@@ -186,13 +182,14 @@ int main(void)
 
   /* Init scheduler */
   osKernelInitialize();
-  /* Create the mutex(es) */
-  /* creation of sensorBufferMutex */
-  sensorBufferMutexHandle = osMutexNew(&sensorBufferMutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
+
+  /* Create the semaphores(s) */
+  /* creation of adcSem */
+  adcSemHandle = osSemaphoreNew(1, 1, &adcSem_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
@@ -213,8 +210,8 @@ int main(void)
   /* creation of telemetryTask */
   telemetryTaskHandle = osThreadNew(StartTelemetryTask, NULL, &telemetryTask_attributes);
 
-  /* creation of EDACTask */
-  EDACTaskHandle = osThreadNew(StartEDACTask, NULL, &EDACTask_attributes);
+  /* creation of LinkMonitorTask */
+  LinkMonitorTaskHandle = osThreadNew(StartLinkMonitorTask, NULL, &LinkMonitorTask_attributes);
 
   /* creation of sensorTask */
   sensorTaskHandle = osThreadNew(StartSensorTask, NULL, &sensorTask_attributes);
@@ -504,24 +501,16 @@ void log_message(const char* msg) {
     }
 }
 
-// Read the satellite sensor (ADC1/IN0 in this case) using DMA.
-void ReadSensor()
-{
-	// Start DMA to do ADC conversion. Call "conversion complete callback" (HAL_ADC_ConvCpltCallback()) when DMA job is finished.
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)sensor_dma_buf, 1);	// Take AN ADC reading and store into var "sensor_dma_buf".
-
-}
-
-
 // Send a message to the Ground Control Station (GCS), by USART1.
 void TelemetryToGCS()
 {
-	char msg[128]={0};																					// Message string, to be sent over USART1/Serial/USB to Ground Control Station. Initialized to 0, to prevent garbage text.
+	char msg[128]={0};																								// Message string, to be sent over USART1/Serial/USB to Ground Control Station. Initialized to 0, to prevent garbage text.
 	uint32_t uptime = HAL_GetTick();  // milliseconds since boot
-	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms \t| Sensor: %5d |\r\n", uptime, sensor_buffer[sensor_buffer_index-1]);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
 
-	HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);								// Send the message string out through USART1 / USB.
-	log_message(msg);
+	// Send message
+	snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms | Sensor: %3d | Link: %3d\r\n", uptime,adc_value,rssi);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
+	HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);											// Send the message string out through USART1 / USB.
+	//log_message(msg);
 }
 
 
@@ -552,9 +541,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		// Copied from "stm32f7
                 log_message(message);
 	        }
 	    	else if (strcmp(command_buffer, "STATUS") == 0) {
-
-	    		//Wait until DMA conversion complete callback is done. This is better with a binary semaphore?
-		    	TelemetryToGCS();			// Send Sensor's value to the Ground Control Station (GCS). This must wait until the ADC conversion is complete and the conversion complete callback function is finished - otherwise it will report a sensor value of '0'.
+		    	TelemetryToGCS();			// Send Status to the Ground Control Station (GCS).
 	        }
 	    	else if (strcmp(command_buffer, "DUMP LOG") == 0) {
                 char response[] = "\r\nLOG DUMP:\r\n";
@@ -579,41 +566,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		// Copied from "stm32f7
 	    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);  // Re-enable interrupt
 	}
 }
-
-// DMA calls this func when done the conversion of the ADC.
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
-    if (hadc->Instance == ADC1) {
-
-
-        // TEST: Send ADC value to USART1.
-        //char msg[64];
-        //snprintf(msg, sizeof(msg), "Sensor Value: %u\r\n", sensor_value);
-        //HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-        // Convert the int sensor_value to a string before sending for logging.
-//        char msg[64];
-//        snprintf(msg, sizeof(msg), "%d", sensor_value);
-//        log_message(msg);
-        //log_message(sensor_value);
-
-    	uint16_t sensor_value;			// This is also the output value of the ADC conversion. Set sensor_value = sensor_dma_buf[0] in HAL_ADC_ConvCpltCallback().
-    										// Use sensor_value to increase code readability, and since this variable will be used by other funcs. Also allows for future manipulations of sensor_dma_buf[] without changing each reference.
-
-  	  // Store the sensor's value in the circular buffer.
-  	  if (osMutexAcquire(sensorBufferMutexHandle, osWaitForever) == osOK) {		// Check MUTEX handle status for the sensor_buffer[] and sensor_buffer_index.
-          sensor_value = sensor_dma_buf[0];										// Use sensor_value to increase code readability, and since this variable will be used by other funcs. Also allows for future manipulations of sensor_dma_buf[] without changing each reference.
-  		  sensor_buffer[sensor_buffer_index] = sensor_value;					// Add latest sensor value to the circular buffer.
-  		  sensor_buffer_index = (sensor_buffer_index + 1) % SENSOR_BUFFER_MAX;	// If index has reached the max buffer size, then reset it to 0.
-  	      osMutexRelease(sensorBufferMutexHandle);
-  	  }
-
-      char response[64];
-      snprintf(response, sizeof(response), "\r\nSensor val: %d\r\n", sensor_value);
-      HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
-
-    }
-}
-
 
 /* USER CODE END 4 */
 
@@ -641,7 +593,7 @@ void StartHealthCheckTask(void *argument)
 
 /* USER CODE BEGIN Header_StartTelemetryTask */
 /**
-* @brief Function implementing the telemetryTask thread. Send receive data to the GCS.... NEEDED??????
+* @brief Function implementing the telemetryTask thread. Send data to the GCS peridically.
 * @param argument: Not used
 * @retval None
 */
@@ -652,57 +604,41 @@ void StartTelemetryTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-		char response1[] = "\r\nSending telemetry auto-update now...\r\n";
-		HAL_UART_Transmit(&huart1, (uint8_t *)response1, strlen(response1), HAL_MAX_DELAY);
-		//TelemetryToGCS();
-
-		char msg[128]={0};																					// Message string, to be sent over USART1/Serial/USB to Ground Control Station. Initialized to 0, to prevent garbage text.
-		uint32_t uptime = HAL_GetTick();  // milliseconds since boot
-		uint16_t senseValue;
-
-		// Check if at the end of the ring buffer.
-		if (osMutexAcquire(sensorBufferMutexHandle, 100) == osOK) {		// Check for MUTEX availability on sensor_buffer[]
-			if (sensor_buffer_index == 0)								//
-				senseValue = sensor_buffer[SENSOR_BUFFER_MAX - 1];
-			else
-				senseValue = sensor_buffer[sensor_buffer_index - 1];
-			osMutexRelease(sensorBufferMutexHandle);					// Release the MUTEX on sensor_buffer[]
-		}
-
-		// Send message
-		snprintf(msg, sizeof(msg), "STATUS: | Uptime: %7lu ms \t| Sensor: %5d |\r\n", uptime,senseValue);	// Populate msg string with text and values. Use snprintf to prevent buffer overflow.
-		HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);								// Send the message string out through USART1 / USB.
-		//log_message(msg);
-
-		osDelay(2000);	// Send telemetry data to GCS every 5 seconds
+	  TelemetryToGCS();
+	  osDelay(3000);	// Send telemetry data to GCS every 3 seconds
   }
   /* USER CODE END StartTelemetryTask */
 }
 
-/* USER CODE BEGIN Header_StartEDACTask */
+/* USER CODE BEGIN Header_StartLinkMonitorTask */
 /**
-* @brief Function implementing the EDACTask thread.
+* @brief Function implementing the LinkMonitorTask thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartEDACTask */
-void StartEDACTask(void *argument)
+/* USER CODE END Header_StartLinkMonitorTask */
+void StartLinkMonitorTask(void *argument)
 {
-  /* USER CODE BEGIN StartEDACTask */
+  /* USER CODE BEGIN StartLinkMonitorTask */
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	  rssi = rand() % 100;  // 0 to 99
+	  char msg[64];
+
+	  if (rssi < 20) {
+		  snprintf(msg, sizeof(msg), "LINK: LOST (RSSI: %d)\r\n", rssi);
+		  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+	  }
+
+	  osDelay(1000);	//Check link every 1 seconds
   }
-  /* USER CODE END StartEDACTask */
+  /* USER CODE END StartLinkMonitorTask */
 }
 
 /* USER CODE BEGIN Header_StartSensorTask */
 /**
 * @brief Function implementing the sensorTask thread.
-* This reads the sensor status periodically, and saves to a ring buffer.
-* The sensor value is simulated by generating a random number between 1-100.
-* Latest buffer value is "sensor_buffer[sensor_buffer_index-1]".
 * @param argument: Not used
 * @retval None
 */
@@ -713,29 +649,14 @@ void StartSensorTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-
-      char response[] = "\r\nChecking sensors\r\n";
-      HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), HAL_MAX_DELAY);
-
-	  // Start DMA to do ADC conversion. Call "conversion complete callback" (HAL_ADC_ConvCpltCallback()) when DMA job is finished.
-	  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)sensor_dma_buf, 1);	// Take AN ADC reading and store into var "sensor_dma_buf".
-
-
-
+	  // ---- Random number version
 	  // Generate a random number, that is used to simulate the sensor value. Between 1 and 100. Use STM32F7's hardware RNG.
-//	  uint32_t value;
-//	  HAL_RNG_GenerateRandomNumber(&hrng, &value);
-//	  int sensorValue = (value % 100) + 1;
-//
-//
-//	  // Store the sensor's value in the circular buffer.
-//	  if (osMutexAcquire(sensorBufferMutexHandle, osWaitForever) == osOK) {		// Check MUTEX handle status for the sensor_buffer[] and sensor_buffer_index.
-//		  sensor_buffer[sensor_buffer_index] = sensorValue;						// Add latest sensor value to the circular buffer.
-//		  sensor_buffer_index = (sensor_buffer_index + 1) % SENSOR_BUFFER_MAX;	// If index has reached the max buffer size, then reset it to 0.
-//	      osMutexRelease(sensorBufferMutexHandle);
-//	  }
-
-	  osDelay(3000);															// Check the sensors every second.
+	  // This is used instead of ADC conversion to generate a value for the Sensor.
+	  uint32_t value;
+	  HAL_RNG_GenerateRandomNumber(&hrng, &value);
+	  //int sensorValue = (value % 100) + 1;
+	  adc_value = (value % 100) + 1;
+    osDelay(1000);
   }
   /* USER CODE END StartSensorTask */
 }
